@@ -7,7 +7,7 @@
 - Production keys are accepted only by a deployment configured with `API_ENVIRONMENT=production`.
 - A request header, query parameter, or client-supplied environment label never overrides the server's `API_ENVIRONMENT`.
 - Key secrets are generated with a cryptographically secure random generator, stored only as SHA-256 hashes, shown once, and never returned by list endpoints.
-- Key management requires a short-lived, trusted PesaGuard-issued HS256 JWT with `sub`, `org_id`, `exp`, `roles`, and (for production key creation) `organization_verified: true`. JWT issuer and audience are checked when configured. Do not mint user tokens from browser input.
+- Key management requires a short-lived PesaGuard `type=access` HS256 JWT with `sub`, `tenant_id`, `exp`, `iat`, `nbf`, `jti`, `iss`, `aud`, and a trusted JWT key ID where configured. The datasource accepts the PesaGuard `organization_id`/`org_id` claim, or uses `tenant_id` as a narrower partition if no organization claim is present. Issuer and audience are required in production. Refresh tokens are rejected.
 - Production key creation requires the JWT to state that the organization is verified and the user has an `owner` or `admin` role. The identity provider must set these claims based on its authoritative records, not client-submitted form fields.
 - Key management routes are organization-scoped. Users cannot list, rotate, or revoke another organization's keys by changing an ID.
 - Rotation revokes the old key and returns a new secret once. Revocation is immediate for subsequent requests.
@@ -18,7 +18,7 @@ Set these server-side variables (never in Vite/browser variables):
 
 - `API_ENVIRONMENT=production` on the live API service.
 - `API_ENVIRONMENT=sandbox` on a separate sandbox service with a separate sandbox database, storage bucket/prefix, credentials, and hostname.
-- `API_KEY_AUTH_JWT_SECRET`: high-entropy shared secret used by the trusted PesaGuard identity service to sign HS256 access tokens.
+- `API_KEY_AUTH_JWT_KEYS_JSON` and `API_KEY_AUTH_JWT_ACTIVE_KID`: preferred rotating key ring copied from the trusted PesaGuard identity configuration. `API_KEY_AUTH_JWT_SECRET` is single-key compatibility mode only. Never expose any of these values to the frontend.
 - `API_KEY_AUTH_JWT_ISSUER` and `API_KEY_AUTH_JWT_AUDIENCE`: configure to the exact identity provider issuer and audience.
 - Continue using `REGISTRY_API_KEYS` only for existing trusted internal service-to-service callers during migration. Never expose it to browser JavaScript or customer API consumers.
 
@@ -26,10 +26,10 @@ Production and sandbox should be separate deployments. Setting a frontend dropdo
 
 ## Migration / rollout
 
-1. Apply `database/migrations/009_environment_scoped_api_keys.sql` to the database.
+1. Apply the repository's Alembic migrations through `head` (`cd backend && python -m alembic -c alembic.ini upgrade head`). The API-key tables are introduced by `0006_api_key_tables`; this repository does not contain a `009_environment_scoped_api_keys.sql` migration.
 2. Configure the JWT secret and matching issuer/audience on the API deployment and identity issuer.
 3. Set `API_ENVIRONMENT=production` on production and provision an isolated sandbox deployment/database/storage.
-4. Configure PesaGuard's trusted identity provider to issue short-lived JWTs with verified `sub`, `org_id`, roles and verification claims.
+4. Configure the datasource to trust the PesaGuard auth_rbac JWT key ring, issuer and audience. The current PesaGuard access-token implementation must provide authoritative organization-verification state before production key issuance can be enabled; absent `organization_verified: true`, production key creation intentionally fails closed.
 5. Test sandbox key on production (403 and audit event), production key on sandbox (403 and audit event), expired/revoked keys (401), cross-organization management (404), unverified organization production-key creation (403), and one-time secret display.
 6. Only then expose key management in the customer dashboard.
 
@@ -49,3 +49,8 @@ Responses to customer keys mask tax PINs (last two characters only) and redact P
 Rotation is atomic: the old key is revoked and the replacement issued in one transaction. If the
 replacement is refused (for example the organization is no longer verified) the old key keeps working.
 Rotation drops any legacy scope outside the allowed set.
+
+
+## Tenant and database boundary notes
+
+API-key rows and API-key audit-event queries are filtered by the authenticated organization/tenant partition, and rotate/revoke lookups include both the key ID and authenticated partition. These application predicates are covered by regression tests. They are not database Row-Level Security: the current schema has no RLS policies for these tables, and the operator workspace remains a system-wide administrative view. Verify PostgreSQL grants and implement/test RLS separately before claiming database-enforced tenant isolation.

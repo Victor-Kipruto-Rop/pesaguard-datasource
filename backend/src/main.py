@@ -16,7 +16,7 @@ from .database import engine,SessionLocal
 from . import models
 from .api import router
 from .api_keys import router as api_keys_router
-from .admin_auth import router as admin_router
+from .admin_auth import router as admin_router, COOKIE_NAME, session_from_request, refresh_session_token
 from .models import WarehouseAccessLog
 structlog.configure(processors=[structlog.processors.TimeStamper(fmt='iso'),structlog.processors.add_log_level,structlog.processors.format_exc_info,structlog.processors.JSONRenderer()],logger_factory=structlog.stdlib.LoggerFactory())
 logging.basicConfig(level=logging.INFO,format='%(message)s')
@@ -69,6 +69,18 @@ async def warehouse_access_telemetry(request,call_next):
      db.commit()
    except Exception:
     log.exception('warehouse_access_telemetry_persist_failed',request_id=request_id)
+
+@app.middleware('http')
+async def sliding_admin_session(request: Request, call_next):
+ response = await call_next(request)
+ if request.url.path.startswith('/api/v1/admin/') and response.status_code < 400:
+  claims = session_from_request(request)
+  if claims:
+   token, renewed = refresh_session_token(claims)
+   response.set_cookie(COOKIE_NAME, token, max_age=max(60, settings.session_ttl_seconds),
+                       httponly=True, secure=settings.session_cookie_secure, samesite='strict', path='/')
+   response.headers['Cache-Control'] = 'no-store'
+ return response
 
 @app.middleware('http')
 async def request_observability(request:Request,call_next):

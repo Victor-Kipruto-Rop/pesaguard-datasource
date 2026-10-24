@@ -1,5 +1,5 @@
 // Same-origin by default in production builds; the dev server talks to the local API.
-const BASE = import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.DEV ? 'http://localhost:8000' : '');
+export const API_BASE = import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.DEV ? 'http://localhost:8000' : '');
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 let csrfToken = '';
 
@@ -12,7 +12,7 @@ export async function api(path, options = {}) {
   const method = (options.method || 'GET').toUpperCase();
   if (!(options.body instanceof FormData) && options.body) headers.set('Content-Type', 'application/json');
   if (!SAFE_METHODS.has(method) && csrfToken && !headers.has('X-CSRF-Token')) headers.set('X-CSRF-Token', csrfToken);
-  const response = await fetch(`${BASE}${path}`, { credentials: 'include', ...options, headers });
+  const response = await fetch(`${API_BASE}${path}`, { credentials: 'include', ...options, headers });
   if (!response.ok) {
     const body = await response.json().catch(() => ({ detail: response.statusText }));
     const detail = body?.detail;

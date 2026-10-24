@@ -17,17 +17,21 @@ import secrets
 import sys
 import threading
 import time
+import logging
+import asyncio
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from .config import settings
 from .database import get_db
-from .models import RegistrySource, IngestionJob, Organization, AuditLog
-from sqlalchemy import select, func
+from .models import RegistrySource, IngestionJob, Organization, AuditLog, WarehouseRawImport, WarehouseAccessLog, FailedImportDLQ, IngestionRowError
+from sqlalchemy import select, func, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from fastapi import Depends, UploadFile
+from fastapi.responses import StreamingResponse
+from .database import SessionLocal
 
 COOKIE_NAME = 'pg_admin_session'
 SAFE_METHODS = {'GET', 'HEAD', 'OPTIONS'}
@@ -36,6 +40,24 @@ router = APIRouter(prefix='/api/v1/admin', tags=['admin session'])
 
 _attempt_lock = threading.Lock()
 _attempts = collections.defaultdict(collections.deque)
+_rate_logger = logging.getLogger(__name__)
+_REDIS_BUCKET_LUA = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local capacity = tonumber(ARGV[2])
+local refill = tonumber(ARGV[3])
+local cost = tonumber(ARGV[4])
+local ttl = tonumber(ARGV[5])
+local state = redis.call('HMGET', key, 'tokens', 'updated')
+local tokens = tonumber(state[1]) or capacity
+local updated = tonumber(state[2]) or now
+tokens = math.min(capacity, tokens + math.max(0, now - updated) * refill)
+local allowed = 0
+if tokens >= cost then tokens = tokens - cost; allowed = 1 end
+redis.call('HMSET', key, 'tokens', tokens, 'updated', now)
+redis.call('EXPIRE', key, ttl)
+return {allowed, math.floor(tokens), math.ceil((cost - tokens) / refill)}
+"""
 
 
 def _b64(value: bytes) -> str:
@@ -92,6 +114,13 @@ def decode_session_token(token: str | None) -> dict | None:
 def session_from_request(request: Request) -> dict | None:
     return decode_session_token(request.cookies.get(COOKIE_NAME))
 
+def refresh_session_token(claims: dict, now: float | None = None) -> tuple[str, dict]:
+    """Issue a sliding-TTL token while preserving the current CSRF secret."""
+    issued = int(now if now is not None else time.time())
+    renewed = {**claims, 'iat': issued, 'exp': issued + max(60, settings.session_ttl_seconds)}
+    payload = _b64(json.dumps(renewed, separators=(',', ':')).encode())
+    return f'{payload}.{_sign(payload)}', renewed
+
 
 def enforce_session_csrf(request: Request, claims: dict) -> None:
     """Cookie-authenticated unsafe requests must prove they came from our dashboard."""
@@ -103,13 +132,35 @@ def enforce_session_csrf(request: Request, claims: dict) -> None:
 
 
 def _check_login_rate(client_host: str) -> None:
-    limit = max(1, settings.admin_login_max_attempts_per_minute)
+    # Redis token bucket is shared across API instances; local fallback is development-only.
+    capacity = max(1, settings.admin_login_max_attempts_per_minute)
+    if settings.redis_url:
+        try:
+            import redis
+            client = redis.Redis.from_url(settings.redis_url, socket_connect_timeout=1, socket_timeout=1,
+                                          decode_responses=True)
+            result = client.eval(_REDIS_BUCKET_LUA, 1,
+                'pg:admin-login:' + hashlib.sha256(client_host.encode()).hexdigest(),
+                time.time(), capacity, capacity / 60.0, 1, 120)
+            allowed, _, retry_after = [int(x) for x in result]
+            if allowed != 1:
+                raise HTTPException(429, 'Too many sign-in attempts. Try again shortly.',
+                                    headers={'Retry-After': str(max(1, retry_after))})
+            return
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _rate_logger.exception('admin_login_redis_rate_limit_unavailable')
+            if settings.app_env.lower() == 'production':
+                raise HTTPException(503, 'Sign-in rate limiter is temporarily unavailable') from exc
+    elif settings.app_env.lower() == 'production':
+        raise HTTPException(503, 'Sign-in rate limiter is not configured')
     now = time.monotonic()
     with _attempt_lock:
         bucket = _attempts[client_host]
         while bucket and now - bucket[0] > 60:
             bucket.popleft()
-        if len(bucket) >= limit:
+        if len(bucket) >= capacity:
             raise HTTPException(429, 'Too many sign-in attempts. Try again in a minute.', headers={'Retry-After': '60'})
         bucket.append(now)
 
@@ -142,8 +193,12 @@ def session(request: Request, response: Response):
 
 
 @router.post('/logout', status_code=204)
-def logout(response: Response):
+def logout(request: Request, response: Response):
+    claims = session_from_request(request)
+    if claims:
+        enforce_session_csrf(request, claims)
     response.delete_cookie(COOKIE_NAME, path='/')
+    response.headers['Cache-Control'] = 'no-store'
     return None
 
 
@@ -263,12 +318,15 @@ def dashboard_delete_source(source_id: str, request: Request, db: Session = Depe
 
 
 @router.get('/ingestion/jobs')
-def dashboard_ingestion_jobs(request: Request, page: int = 1, page_size: int = 50, status: str | None = None,
+def dashboard_ingestion_jobs(request: Request, page: int = 1, page_size: int = 50, status: str | None = None, q: str | None = None,
                              db: Session = Depends(get_db)):
     require_admin(request)
     page = max(1,page); page_size = max(1,min(page_size,100))
     stmt = select(IngestionJob)
     if status: stmt = stmt.where(IngestionJob.status == status.upper())
+    if q and q.strip():
+        pattern = '%' + q.strip()[:200] + '%'
+        stmt = stmt.where(or_(IngestionJob.file_name.ilike(pattern), IngestionJob.source_name.ilike(pattern), IngestionJob.status.ilike(pattern), IngestionJob.id.ilike(pattern)))
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     rows = db.scalars(stmt.order_by(IngestionJob.created_at.desc()).offset((page-1)*page_size).limit(page_size)).all()
     return {'items':[{'id':j.id,'file_name':j.file_name,'source_id':j.source_id,'source_name':j.source_name,'status':j.status,
@@ -330,3 +388,191 @@ def dashboard_complete_upload(job_id: str, request: Request, db: Session = Depen
     require_admin(request)
     from .api import complete_direct_upload
     return complete_direct_upload(job_id, db)
+
+# Workspace overview endpoints. All counts are computed from persisted datasource records.
+@router.get('/workspace/metrics')
+def workspace_metrics(request: Request, db: Session = Depends(get_db)):
+    require_admin(request)
+    total_orgs = db.scalar(select(func.count()).select_from(Organization)) or 0
+    total_jobs = db.scalar(select(func.count()).select_from(IngestionJob)) or 0
+    completed = db.scalar(select(func.count()).select_from(IngestionJob).where(IngestionJob.status.in_(['COMPLETED','COMPLETED_WITH_ERRORS']))) or 0
+    failed = db.scalar(select(func.count()).select_from(IngestionJob).where(IngestionJob.status.in_(['FAILED','ERROR']))) or 0
+    source_count = db.scalar(select(func.count()).select_from(RegistrySource).where(RegistrySource.enabled.is_(True))) or 0
+    return {'indexed_organizations':total_orgs,'ingestion_jobs':total_jobs,'completed_jobs':completed,
+            'failed_jobs':failed,'enabled_sources_count':source_count,'connected_sources_count':None,'generated_at':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),
+            'source':'database'}
+
+
+@router.get('/ingestion/activity')
+def ingestion_activity(request: Request, limit: int = 50, db: Session = Depends(get_db)):
+    require_admin(request)
+    limit = max(1, min(limit, 200))
+    rows = db.scalars(select(IngestionJob).order_by(IngestionJob.created_at.desc()).limit(limit)).all()
+    events = []
+    chronological = list(reversed(rows))
+    volumes = [max(0, int(j.records_processed or 0)) for j in chronological]
+    for i, job in enumerate(chronological):
+        # Compare this job only with preceding observations; flag only with at least five baselines.
+        history = volumes[max(0, i - 7):i]
+        volume = volumes[i]
+        anomaly = None
+        if len(history) >= 5:
+            mean = sum(history) / len(history)
+            variance = sum((v - mean) ** 2 for v in history) / len(history)
+            std = variance ** 0.5
+            if std > 0 and abs(volume - mean) / std >= 3:
+                anomaly = {'type':'volume_spike' if volume > mean else 'volume_drop', 'z_score':round((volume-mean)/std, 2)}
+        events.append({'job_id':job.id,'created_at':job.created_at.isoformat() if job.created_at else None,
+            'status':job.status,'records_processed':volume,'records_inserted':int(job.records_inserted or 0),
+            'anomaly':anomaly})
+    events.reverse()
+    return {'items':events,'count':len(events),'generated_at':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat(),
+            'source':'database'}
+
+
+@router.get('/registry/overview')
+def registry_overview(request: Request, db: Session = Depends(get_db)):
+    require_admin(request)
+    total = db.scalar(select(func.count()).select_from(Organization)) or 0
+    if not total:
+        return {'total_records':0,'completeness_percentage':None,'null_assertion_pass_percentage':None,
+                'unreviewed_records':0,'source':'database','generated_at':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()}
+    rows = db.execute(select(Organization.legal_name, Organization.registration_number, Organization.tax_pin,
+                             Organization.status, Organization.data_quality_status)).all()
+    total_fields = len(rows) * 4
+    present_fields = sum(sum(value is not None and str(value).strip() != '' for value in row[:4]) for row in rows)
+    completeness = round((present_fields / total_fields) * 100, 2) if total_fields else None
+    reviewed = sum(1 for row in rows if str(row[4] or '').upper() not in {'UNREVIEWED', 'UNKNOWN', ''})
+    return {'total_records':total,'completeness_percentage':completeness,
+            'null_assertion_pass_percentage':round(present_fields / total_fields * 100, 2) if total_fields else None,
+            'unreviewed_records':total-reviewed,'source':'database',
+            'generated_at':__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()}
+
+
+
+@router.get('/data-quality/overview')
+def admin_data_quality_overview(request: Request, db: Session = Depends(get_db)):
+    require_admin(request)
+    total = db.scalar(select(func.count()).select_from(Organization)) or 0
+    rows = db.execute(select(Organization.legal_name, Organization.registration_number,
+                             Organization.tax_pin, Organization.status,
+                             Organization.data_quality_status)).all()
+    required_fields = 4
+    field_slots = len(rows) * required_fields
+    present = sum(sum(value is not None and str(value).strip() != '' for value in row[:required_fields]) for row in rows)
+    complete_rows = sum(all(value is not None and str(value).strip() != '' for value in row[:required_fields]) for row in rows)
+    row_errors = db.scalar(select(func.count()).select_from(IngestionRowError)) or 0
+    unreviewed = sum(1 for row in rows if str(row[4] or '').upper() in {'UNREVIEWED', 'UNKNOWN', ''})
+    return {'total_records': total, 'complete_records': complete_rows,
+            'incomplete_records': max(0, total - complete_rows),
+            'completeness_percentage': round(present / field_slots * 100, 2) if field_slots else None,
+            'complete_record_percentage': round(complete_rows / total * 100, 2) if total else None,
+            'unreviewed_records': unreviewed, 'ingestion_row_errors': row_errors,
+            'required_fields': ['legal_name', 'registration_number', 'tax_pin', 'status'],
+            'source': 'database', 'generated_at': __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()}
+
+
+@router.get('/warehouse/overview')
+def admin_warehouse_overview(request: Request, db: Session = Depends(get_db)):
+    require_admin(request)
+    import_count = db.scalar(select(func.count()).select_from(WarehouseRawImport)) or 0
+    total_bytes = db.scalar(select(func.coalesce(func.sum(WarehouseRawImport.byte_size), 0))) or 0
+    access_count = db.scalar(select(func.count()).select_from(WarehouseAccessLog)) or 0
+    dlq_count = db.scalar(select(func.count()).select_from(FailedImportDLQ).where(FailedImportDLQ.resolved_at.is_(None))) or 0
+    imports = db.scalars(select(WarehouseRawImport).order_by(WarehouseRawImport.created_at.desc()).limit(50)).all()
+    access = db.scalars(select(WarehouseAccessLog).order_by(WarehouseAccessLog.created_at.desc()).limit(20)).all()
+    return {'raw_imports': import_count, 'stored_bytes': int(total_bytes), 'warehouse_access_events': access_count,
+            'unresolved_dead_letter_rows': dlq_count,
+            'imports': [{'id': x.id, 'job_id': x.ingestion_job_id, 'file_name': x.original_filename,
+                         'content_type': x.content_type, 'byte_size': int(x.byte_size or 0),
+                         'source_name': x.source_name, 'status': x.import_status,
+                         'created_at': x.created_at.isoformat() if x.created_at else None} for x in imports],
+            'access_events': [{'id': x.id, 'request_id': x.request_id, 'caller_service': x.caller_service,
+                               'endpoint': x.endpoint, 'method': x.http_method, 'status_code': x.response_status,
+                               'duration_ms': x.duration_ms, 'outcome': x.outcome,
+                               'created_at': x.created_at.isoformat() if x.created_at else None} for x in access],
+            'source': 'database', 'generated_at': __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()}
+
+
+@router.get('/validation/rules')
+def admin_validation_rules(request: Request):
+    require_admin(request)
+    # These are application-level checks, not user-configurable rules stored in the database.
+    rules = [
+        {'id': 'legal-name-required', 'name': 'Legal name required', 'field': 'legal_name',
+         'severity': 'error', 'status': 'enforced', 'description': 'Every registry organization must have a non-empty legal name.'},
+        {'id': 'registration-number-unique', 'name': 'Registration number uniqueness', 'field': 'normalized_registration_number',
+         'severity': 'error', 'status': 'enforced', 'description': 'A normalized registration number cannot belong to two registry records.'},
+        {'id': 'tax-pin-presence', 'name': 'Tax PIN presence', 'field': 'tax_pin',
+         'severity': 'review', 'status': 'measured', 'description': 'Presence is measured for completeness; this does not verify a PIN with KRA.'},
+        {'id': 'registration-number-presence', 'name': 'Registration number presence', 'field': 'registration_number',
+         'severity': 'review', 'status': 'measured', 'description': 'Presence is measured for completeness; this does not verify BRS registration.'},
+        {'id': 'source-provenance', 'name': 'Source provenance', 'field': 'source_name/source_file/source_row',
+         'severity': 'review', 'status': 'partially-tracked', 'description': 'Ingestion records retain available source provenance metadata.'},
+    ]
+    return {'items': rules, 'total': len(rules), 'editable': False, 'source': 'application-defined',
+            'note': 'Rules are defined by application behavior. There is no persisted rule-management model in this deployment.',
+            'generated_at': __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()}
+
+
+@router.get('/audit/logs')
+def admin_audit_logs(request: Request, limit: int = 100, db: Session = Depends(get_db)):
+    require_admin(request)
+    limit = max(1, min(limit, 200))
+    rows = db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(limit)).all()
+    return {'items': [{'id': x.id, 'action': x.action, 'actor': x.actor, 'file_name': x.file_name,
+                       'detail_fields': sorted(list((x.details or {}).keys())) if isinstance(x.details, dict) else [],
+                       'created_at': x.created_at.isoformat() if x.created_at else None} for x in rows],
+            'count': len(rows), 'source': 'database',
+            'generated_at': __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()}
+
+
+@router.get('/settings/overview')
+def admin_settings_overview(request: Request):
+    require_admin(request)
+    origins = settings.cors_origin_list
+    return {'environment': settings.app_env, 'api_environment': settings.api_environment,
+            'database': {'configured': bool(settings.database_url), 'engine': 'postgresql' if 'postgres' in settings.database_url.lower() else ('sqlite/local' if settings.database_url.lower().startswith('sqlite') else 'unknown')},
+            'object_storage': {'configured': all([settings.r2_account_id, settings.r2_access_key_id, settings.r2_secret_access_key, settings.r2_bucket_name])},
+            'redis': {'configured': bool(settings.redis_url), 'required_for_distributed_admin_rate_limit': bool(settings.admin_password_hash)},
+            'operator_session': {'http_only_cookie': True, 'secure_cookie': settings.session_cookie_secure,
+                                 'same_site': 'strict', 'ttl_seconds': settings.session_ttl_seconds,
+                                 'distributed_rate_limit_configured': bool(settings.redis_url)},
+            'cors_origins': origins, 'metrics_token_configured': bool(settings.metrics_token),
+            'secrets_exposed': False, 'editable': False,
+            'note': 'Read-only diagnostic summary. Secret values are never returned by this endpoint.',
+            'source': 'runtime-configuration'}
+
+@router.get('/workspace/stream')
+async def workspace_stream(request: Request):
+    """Cookie-authenticated SSE snapshots for the live workspace; no credentials in the URL."""
+    require_admin(request)
+
+    async def events():
+        while not await request.is_disconnected():
+            try:
+                with SessionLocal() as db:
+                    total_orgs = db.scalar(select(func.count()).select_from(Organization)) or 0
+                    total_jobs = db.scalar(select(func.count()).select_from(IngestionJob)) or 0
+                    completed = db.scalar(select(func.count()).select_from(IngestionJob).where(IngestionJob.status.in_(['COMPLETED','COMPLETED_WITH_ERRORS']))) or 0
+                    failed = db.scalar(select(func.count()).select_from(IngestionJob).where(IngestionJob.status.in_(['FAILED','ERROR']))) or 0
+                    source_count = db.scalar(select(func.count()).select_from(RegistrySource).where(RegistrySource.enabled.is_(True))) or 0
+                    jobs = db.scalars(select(IngestionJob).order_by(IngestionJob.created_at.desc()).limit(50)).all()
+                    payload = {
+                        'metrics': {'indexed_organizations': total_orgs, 'ingestion_jobs': total_jobs,
+                            'completed_jobs': completed, 'failed_jobs': failed,
+                            'enabled_sources_count': source_count, 'connected_sources_count': None, 'source': 'database'},
+                        'jobs': [{'id': j.id, 'job_id': j.id, 'file_name': j.file_name, 'status': j.status,
+                            'records_processed': int(j.records_processed or 0), 'records_inserted': int(j.records_inserted or 0),
+                            'created_at': j.created_at.isoformat() if j.created_at else None,
+                            'error_summary': j.error_summary, 'source_name': j.source_name} for j in jobs],
+                        'generated_at': __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()
+                    }
+                yield 'event: workspace\ndata: ' + json.dumps(payload, separators=(',', ':')) + '\n\n'
+            except Exception:
+                _rate_logger.exception('workspace_sse_snapshot_failed')
+                yield 'event: error\ndata: {"message":"Workspace snapshot temporarily unavailable"}\n\n'
+            await asyncio.sleep(5)
+
+    return StreamingResponse(events(), media_type='text/event-stream',
+        headers={'Cache-Control':'no-cache, no-transform', 'X-Accel-Buffering':'no'})

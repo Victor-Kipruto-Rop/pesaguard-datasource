@@ -1,6 +1,7 @@
 """Run with: python -m src.worker [--batch]. PostgreSQL is required for multiple workers."""
 import argparse
 import logging
+import random
 import time
 import traceback
 from contextlib import nullcontext
@@ -365,6 +366,16 @@ def _process_csv(db, job, raw_import):
              precedence_skipped=precedence_skipped, **counts)
 
 
+def _retry_delay_seconds(attempts: int) -> int:
+    """Return bounded exponential backoff with jitter to avoid synchronized retry storms."""
+    base = max(1, int(settings.worker_retry_seconds))
+    ceiling = max(base, int(settings.worker_retry_max_seconds))
+    exponent = min(max(0, int(attempts) - 1), 30)
+    exponential = min(ceiling, base * (2 ** exponent))
+    # Equal jitter: retain at least half the delay while spreading concurrent retries.
+    return max(1, int(round(random.uniform(exponential * 0.5, exponential))))
+
+
 def _schedule_retry_or_fail(job_id, exc):
     with SessionLocal() as retry_db:
         job = retry_db.get(IngestionJob, job_id)
@@ -375,7 +386,7 @@ def _schedule_retry_or_fail(job_id, exc):
             job.status = 'QUEUED'
             if raw_import:
                 raw_import.import_status = 'QUEUED'
-            job.next_attempt_at = now() + timedelta(seconds=max(1, settings.worker_retry_seconds) * (2 ** max(0, job.attempts - 1)))
+            job.next_attempt_at = now() + timedelta(seconds=_retry_delay_seconds(job.attempts))
             job.error_summary = f'Attempt {job.attempts} failed; retry scheduled. {str(exc)[:500]}'
         else:
             job.status = 'FAILED'

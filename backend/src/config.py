@@ -7,6 +7,8 @@ class Settings(BaseSettings):
  registry_api_keys:str=''
  api_environment:str='production'
  api_key_auth_jwt_secret:str=''
+ api_key_auth_jwt_keys_json:str=''
+ api_key_auth_jwt_active_kid:str='current'
  api_key_auth_jwt_issuer:str=''
  api_key_auth_jwt_audience:str=''
  cors_origins:str='http://localhost:5173'
@@ -19,6 +21,7 @@ class Settings(BaseSettings):
  worker_poll_seconds:float=2.0
  worker_max_attempts:int=3
  worker_retry_seconds:int=30
+ worker_retry_max_seconds:int=900
  worker_stale_after_seconds:int=900
  worker_max_jobs_per_run:int=10
  pdf_ocr_enabled:bool=False
@@ -79,11 +82,15 @@ def validate_runtime_config():
   missing.append('HMAC_SHARED_SECRET')
  if settings.require_hmac and not settings.redis_url:
   missing.append('REDIS_URL (required for distributed HMAC replay protection)')
- if settings.api_key_auth_jwt_secret and not (settings.api_key_auth_jwt_issuer and settings.api_key_auth_jwt_audience):
-  missing.append('API_KEY_AUTH_JWT_ISSUER/API_KEY_AUTH_JWT_AUDIENCE (required when API_KEY_AUTH_JWT_SECRET is set)')
+ if not (settings.api_key_auth_jwt_secret or settings.api_key_auth_jwt_keys_json):
+  missing.append('API_KEY_AUTH_JWT_KEYS_JSON or API_KEY_AUTH_JWT_SECRET (PesaGuard identity signing keys)')
+ if not (settings.api_key_auth_jwt_issuer and settings.api_key_auth_jwt_audience):
+  missing.append('API_KEY_AUTH_JWT_ISSUER/API_KEY_AUTH_JWT_AUDIENCE (PesaGuard identity token validation)')
  if settings.api_environment.lower().strip() not in {'sandbox','production'}:
   missing.append('API_ENVIRONMENT (must be sandbox or production)')
  if settings.admin_password_hash and not settings.session_cookie_secure:
   missing.append('SESSION_COOKIE_SECURE=true (required for dashboard sessions in production)')
+ if settings.admin_password_hash and not settings.redis_url:
+  missing.append('REDIS_URL (required for distributed admin login rate limiting)')
  if missing:
   raise RuntimeError('Invalid production configuration: '+', '.join(missing))

@@ -3,10 +3,11 @@ import logging
 import sys
 from datetime import datetime, timezone
 
-from sqlalchemy import inspect, select, func
+from sqlalchemy import inspect, select, func, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from .database import engine, SessionLocal
+from .config import settings
 from .models import IngestionJob
 from .storage import health_check
 
@@ -32,6 +33,18 @@ def main() -> int:
     try:
         with engine.connect() as connection:
             connection.exec_driver_sql("SELECT 1")
+            if engine.dialect.name == "postgresql":
+                role = connection.execute(text("""
+                    SELECT current_user AS role_name, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb
+                    FROM pg_roles WHERE rolname = current_user
+                """)).mappings().first()
+                if role and any(bool(role[field]) for field in ("rolsuper", "rolbypassrls", "rolcreaterole", "rolcreatedb")):
+                    log.error("Database runtime role has elevated cluster privileges; use a least-privilege application role")
+                    if settings.app_env.lower() == "production":
+                        return 1
+                    log.warning("Continuing outside production; reduce database role privileges before deployment")
+                elif role:
+                    log.info("Database role privilege check: least-privilege flags OK (role name withheld)")
         existing = set(inspect(engine).get_table_names())
         missing = sorted(REQUIRED_TABLES - existing)
         if missing:

@@ -18,6 +18,8 @@ def client(monkeypatch):
     monkeypatch.setattr(settings, 'session_secret', 's' * 48)
     monkeypatch.setattr(settings, 'session_cookie_secure', False)
     monkeypatch.setattr(settings, 'admin_login_max_attempts_per_minute', 5)
+    monkeypatch.setattr(settings, 'redis_url', '')
+    monkeypatch.setattr(settings, 'app_env', 'test')
     admin_auth._attempts.clear()
     return TestClient(app)
 
@@ -68,7 +70,9 @@ def test_tampered_expired_and_logged_out_sessions_are_rejected(client):
     fresh = TestClient(app)
     fresh.cookies.set('pg_admin_session', expired)
     assert fresh.get('/api/v1/organizations').status_code == 401
-    assert client.post('/api/v1/admin/logout').status_code == 204
+    assert client.post('/api/v1/admin/logout').status_code == 403  # logout is a cookie-authenticated state change
+    csrf = client.get('/api/v1/admin/session').json()['csrf_token']
+    assert client.post('/api/v1/admin/logout', headers={'X-CSRF-Token': csrf}).status_code == 204
     assert client.get('/api/v1/organizations').status_code == 401
 
 
@@ -83,3 +87,15 @@ def test_session_secret_must_be_long_when_login_is_enabled(monkeypatch):
     monkeypatch.setattr(settings, 'session_secret', 'short')
     with pytest.raises(RuntimeError):
         validate_runtime_config()
+
+
+def test_production_login_fails_closed_when_redis_is_unavailable(client, monkeypatch):
+    import redis
+    monkeypatch.setattr(settings, 'app_env', 'production')
+    monkeypatch.setattr(settings, 'redis_url', 'redis://unavailable.invalid:6379/0')
+    def unavailable(*args, **kwargs):
+        raise redis.ConnectionError('simulated redis outage')
+    monkeypatch.setattr(redis.Redis, 'from_url', unavailable)
+    response = _login(client)
+    assert response.status_code == 503
+    assert 'rate limiter' in response.json()['detail'].lower()
